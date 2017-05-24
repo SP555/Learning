@@ -1,0 +1,163 @@
+Something as simple as ad-hoc selfhosting a WCF service can be fairly difficult if you need to use https.  This is because of all the underlying pieces than need to be configured to properly host on a secure transport.  In this fairly lengthy posting, I will go through a walkthrough of creating a simple selfhosted HelloWorld WCF service, entirely by hand, and modify it to listen over https.  Along the way, I will run into several common errors and give the solutions to these.
+ 
+Disclaimer: By no means is this intended for production.  The purpose of this is to give an example of test code which self-hosts a WCF service using https.
+ 
+Write the simple WCF service you want to host.  The following are the steps I took for this:
+Create a new Console Application in Visual Studio.
+Add a reference to System.ServiceModel.
+Write a service contract and a service class which implements it.
+In Main, create an address, binding, and serviceHost.  Add the endpoint to the host and start the host.
+So, the finished project looks like this:
+ 
+using System;
+using System.ServiceModel;
+ 
+namespace HttpsSelfhost
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            string address = “http://localhost/HelloWorldService“;
+            BasicHttpBinding binding = new BasicHttpBinding();
+           
+            ServiceHost host = new ServiceHost(typeof(HelloWorldService));
+            host.AddServiceEndpoint(typeof(IHelloWorld), binding, address);
+            host.Open();
+           
+            Console.WriteLine(“Host is {0}.  Press enter to close.”, host.State);
+            Console.ReadLine();
+            host.Close();
+        }
+    }
+ 
+    [ServiceContract]
+    public interface IHelloWorld
+    {
+        [OperationContract]
+        void HelloWorld();
+    }
+ 
+    public class HelloWorldService : IHelloWorld
+    {
+        public void HelloWorld()
+        {
+            Console.WriteLine(“Hello World!”);
+        }
+    }
+}
+ 
+Now, I want a client to test it.
+I can create a new console app for this.  In short, it looks like this:
+ 
+using System;
+using System.ServiceModel;
+ 
+namespace HelloWorldClient
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            Console.WriteLine(“Press enter when the service is opened.”);
+            Console.ReadLine();
+ 
+            string address = “http://localhost/HelloWorldService“;
+            BasicHttpBinding binding = new BasicHttpBinding();
+ 
+            ChannelFactory<IHelloWorld> factory = new ChannelFactory<IHelloWorld>(binding, address);
+            IHelloWorld client = factory.CreateChannel();
+            Console.WriteLine(“Invoking HelloWorld on the service.”);
+            client.HelloWorld();
+            Console.WriteLine(“Press enter to quit.”);
+            Console.ReadLine();
+        }
+    }
+ 
+    [ServiceContract]
+    public interface IHelloWorld
+    {
+        [OperationContract]
+        void HelloWorld();
+    }
+}
+ 
+In Visual Studio, under the Solution properties, I set the Startup Type to multiple and have both the service and client projects start.  Hitting f5 brings me to the first error:
+AddressAccessDeniedException: HTTP could not register URL http://+:80/HelloWorldService/. Your process does not have access rights to this namespace (see http://go.microsoft.com/fwlink/?LinkId=70353 for details).
+The reason for this error is that I am running VS as a non-admin.  Also, I’m planning on hosting over https, so I’ll want a different port anyway.  So, I modify the address, for both the client and service, to be:
+string address = “http://localhost:1234/HelloWorldService“;
+Then restart VS as an admin.  When I hit F5, I can start the client once the service indicates it’s open. 
+The advantage of this is that it’s pretty well decoupled from the service.  The disadvantage is that any time I change my service address, binding, or contract, I need to fix it on my client as well.  But for quick ad-hoc testing, this is a great place to start.  Now, I want to modify it to use https.
+ 
+Now I want to start modifying this for https.  I still want to use port 1234, but I want secure transport. 
+Blindly doing this, I simply change the address to use https instead of http:
+ 
+string address = “https://localhost:1234/HelloWorldService“;
+ 
+This yields the following exception:
+ArgumentException: The provided URI scheme ‘https’ is invalid; expected ‘http’.
+Parameter name: context.ListenUriBaseAddress
+To fix this, we need to add the following to the binding:
+ 
+binding.Security.Mode = BasicHttpSecurityMode.Transport;
+ 
+Now I’m much closer: the ServiceHost actually opens.  But when I try to invoke it with the client, I get the following:
+CommunicationException: An error occurred while making the HTTP request to https://localhost:1234/HelloWorldService. This could be due to the fact that the server certificate is not configured properly with HTTP.SYS in the HTTPS case. This could also be caused by a mismatch of the security binding between the client and the server.
+That means I have to configure the port with an SSL certificate.  I want a self-signed certificate for this.  There are details about this here: http://msdn.microsoft.com/en-us/library/ms733791.aspx, but I’m going to give a quick and dirty summary of what needs to be done.  It probably differs a bit from that article.  Remember, this isn’t intended for a production environment…
+First, use netsh to add a namespace reservation for the port:
+ 
+netsh http add urlacl url=https://+:1234/ user=EVERYONE
+ 
+But that’s not enough, we need a self-signed cert to bind to that port.  Otherwise, you’ll get the same exception as above.  Create the cert using makecert.exe, which tends to reside in the windows sdk folder.  Something like \Program Files\Microsoft SDKs\Windows\v7.0A\Bin.  First, create the root certificate to use for signing the server certificate.  <machineName> can be localhost, which is what I’m using.
+ 
+makecert.exe -sk RootCA -sky signature -pe -n CN=<machineName> -r -sr LocalMachine -ss Root MyCA.cer
+ 
+This creates a cert named MyCA.cer.  You should see that file in the working directory from where you ran makecert.exe.
+Next, create the server certificate.  <certificate path> should be something to use to identify the cert.  I’ll use MyAdHocTestCert.cer.
+ 
+makecert.exe -sk server -sky exchange -pe -n CN=<machineName> -ir LocalMachine -is Root -ic MyCA.cer -sr LocalMachine -ss My <certificate path>
+ 
+Now, you have to bind the cert to the port.  This gets tricky because if you execute it from command-line, you have to enter the certificate’s thumbprint.  Or, you can execute the command via code if you know the certificate path, which was MyAdHocTestCert.cer.  To quickly execute this process via code, I’m using the following:
+ 
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography.X509Certificates;
+ 
+namespace BindCertToPort
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            int port = 1234;
+            string certPath = “MyAdHocTestCert.cer”;
+            X509Certificate2 certificate = new X509Certificate2(certPath);
+ 
+            // netsh http add sslcert ipport=0.0.0.0:<port> certhash={<thumbprint>} appid={<some GUID>}
+            Process bindPortToCertificate = new Process();
+            bindPortToCertificate.StartInfo.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SystemX86), “netsh.exe”);
+            bindPortToCertificate.StartInfo.Arguments = string.Format(“http add sslcert ipport=0.0.0.0:{0} certhash={1} appid={{{2}}}”, port, certificate.Thumbprint, Guid.NewGuid());
+            bindPortToCertificate.Start();
+            bindPortToCertificate.WaitForExit();
+        }
+    }
+}
+ 
+Note that the above code expects that the actual MyAdHocTestCert.cer file is in the same location as the BindCertToPort executable.
+And that’s it!  At this point, I can start the service and invoke the HelloWorld() operation over https.
+Tips
+To see the port reservations, use
+netsh http show urlacl.
+To delete the port reservation for port 1234, use
+netsh http delete urlacl url=https://+:1234/
+Note: If the certificate is still bound to the port, you still should be able to invoke the service over https.
+To delete the certificate – port binding thingy, use
+netsh http delete sslcert ipport=0.0.0.0:<port>
+You can look at certificates using the certificates snapin in mmc.  I use this tool for removing certs I set up.  You can also delete a certificate via code, something like this:
+ 
+X509Certificate2 cert = new X509Certificate2(certificatePath);
+X509Store store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
+store.Open(OpenFlags.ReadWrite);
+store.Remove(cert);
+store.Close();
